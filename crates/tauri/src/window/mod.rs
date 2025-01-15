@@ -125,7 +125,7 @@ unstable_struct!(
   }
 );
 
-impl<'a, R: Runtime, M: Manager<R>> fmt::Debug for WindowBuilder<'a, R, M> {
+impl<R: Runtime, M: Manager<R>> fmt::Debug for WindowBuilder<'_, R, M> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("WindowBuilder")
       .field("label", &self.label)
@@ -381,7 +381,11 @@ tauri::Builder::default()
       );
 
       if let Some(webview) = detached_window.webview {
-        app_manager.webview.attach_webview(window.clone(), webview);
+        app_manager.webview.attach_webview(
+          window.clone(),
+          webview.webview,
+          webview.use_https_scheme,
+        );
       }
 
       window
@@ -531,7 +535,7 @@ impl<'a, R: Runtime, M: Manager<R>> WindowBuilder<'a, R, M> {
   #[must_use]
   #[deprecated(
     since = "1.2.0",
-    note = "The window is automatically focused by default. This function Will be removed in 2.0.0. Use `focused` instead."
+    note = "The window is automatically focused by default. This function Will be removed in 3.0.0. Use `focused` instead."
   )]
   pub fn focus(mut self) -> Self {
     self.window_builder = self.window_builder.focused(true);
@@ -638,6 +642,13 @@ impl<'a, R: Runtime, M: Manager<R>> WindowBuilder<'a, R, M> {
   #[must_use]
   pub fn skip_taskbar(mut self, skip: bool) -> Self {
     self.window_builder = self.window_builder.skip_taskbar(skip);
+    self
+  }
+
+  /// Sets custom name for Windows' window class. **Windows only**.
+  #[must_use]
+  pub fn window_classname<S: Into<String>>(mut self, classname: S) -> Self {
+    self.window_builder = self.window_builder.window_classname(classname);
     self
   }
 
@@ -835,6 +846,18 @@ impl<'a, R: Runtime, M: Manager<R>> WindowBuilder<'a, R, M> {
   }
 }
 
+impl<R: Runtime, M: Manager<R>> WindowBuilder<'_, R, M> {
+  /// Set the window and webview background color.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Windows**: alpha channel is ignored.
+  #[must_use]
+  pub fn background_color(mut self, color: Color) -> Self {
+    self.window_builder = self.window_builder.background_color(color);
+    self
+  }
+}
 /// A wrapper struct to hold the window menu state
 /// and whether it is global per-app or specific to this window.
 #[cfg(desktop)]
@@ -1142,7 +1165,7 @@ tauri::Builder::default()
           .map(crate::menu::map_to_menu_theme)
           .unwrap_or(muda::MenuTheme::Auto);
 
-        let _ = menu_.inner().init_for_hwnd_with_theme(hwnd.0 as _, theme);
+        let _ = unsafe { menu_.inner().init_for_hwnd_with_theme(hwnd.0 as _, theme) };
       }
       #[cfg(any(
         target_os = "linux",
@@ -1183,7 +1206,7 @@ tauri::Builder::default()
       self.run_on_main_thread(move || {
         #[cfg(windows)]
         if let Ok(hwnd) = window.hwnd() {
-          let _ = menu.inner().remove_for_hwnd(hwnd.0 as _);
+          let _ = unsafe { menu.inner().remove_for_hwnd(hwnd.0 as _) };
         }
         #[cfg(any(
           target_os = "linux",
@@ -1215,7 +1238,7 @@ tauri::Builder::default()
       self.run_on_main_thread(move || {
         #[cfg(windows)]
         if let Ok(hwnd) = window.hwnd() {
-          let _ = menu_.inner().hide_for_hwnd(hwnd.0 as _);
+          let _ = unsafe { menu_.inner().hide_for_hwnd(hwnd.0 as _) };
         }
         #[cfg(any(
           target_os = "linux",
@@ -1243,7 +1266,7 @@ tauri::Builder::default()
       self.run_on_main_thread(move || {
         #[cfg(windows)]
         if let Ok(hwnd) = window.hwnd() {
-          let _ = menu_.inner().show_for_hwnd(hwnd.0 as _);
+          let _ = unsafe { menu_.inner().show_for_hwnd(hwnd.0 as _) };
         }
         #[cfg(any(
           target_os = "linux",
@@ -1272,7 +1295,7 @@ tauri::Builder::default()
       self.run_on_main_thread(move || {
         #[cfg(windows)]
         if let Ok(hwnd) = window.hwnd() {
-          let _ = tx.send(menu_.inner().is_visible_on_hwnd(hwnd.0 as _));
+          let _ = tx.send(unsafe { menu_.inner().is_visible_on_hwnd(hwnd.0 as _) });
         }
         #[cfg(any(
           target_os = "linux",
@@ -1370,6 +1393,11 @@ impl<R: Runtime> Window<R> {
     self.window.dispatcher.is_resizable().map_err(Into::into)
   }
 
+  /// Whether the window is enabled or disabled.
+  pub fn is_enabled(&self) -> crate::Result<bool> {
+    self.window.dispatcher.is_enabled().map_err(Into::into)
+  }
+
   /// Gets the window's native maximize button state
   ///
   /// ## Platform-specific
@@ -1461,12 +1489,9 @@ impl<R: Runtime> Window<R> {
       .map_err(Into::into)
       .and_then(|handle| {
         if let raw_window_handle::RawWindowHandle::AppKit(h) = handle.as_raw() {
-          Ok(unsafe {
-            use objc::*;
-            let ns_window: cocoa::base::id =
-              objc::msg_send![h.ns_view.as_ptr() as cocoa::base::id, window];
-            ns_window as *mut _
-          })
+          let view: &objc2_app_kit::NSView = unsafe { h.ns_view.cast().as_ref() };
+          let ns_window = view.window().expect("view to be installed in window");
+          Ok(objc2::rc::Retained::autorelease_ptr(ns_window).cast())
         } else {
           Err(crate::Error::InvalidWindowHandle)
         }
@@ -1653,6 +1678,15 @@ impl<R: Runtime> Window<R> {
       .map_err(Into::into)
   }
 
+  /// Enable or disable the window.
+  pub fn set_enabled(&self, enabled: bool) -> crate::Result<()> {
+    self
+      .window
+      .dispatcher
+      .set_enabled(enabled)
+      .map_err(Into::into)
+  }
+
   /// Maximizes this window.
   pub fn maximize(&self) -> crate::Result<()> {
     self.window.dispatcher.maximize().map_err(Into::into)
@@ -1792,6 +1826,20 @@ tauri::Builder::default()
       .window
       .dispatcher
       .set_visible_on_all_workspaces(visible_on_all_workspaces)
+      .map_err(Into::into)
+  }
+
+  /// Sets the window background color.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Windows:** alpha channel is ignored.
+  /// - **iOS / Android:** Unsupported.
+  pub fn set_background_color(&self, color: Option<Color>) -> crate::Result<()> {
+    self
+      .window
+      .dispatcher
+      .set_background_color(color)
       .map_err(Into::into)
   }
 
@@ -1966,6 +2014,44 @@ tauri::Builder::default()
       .map_err(Into::into)
   }
 
+  /// Sets the overlay icon on the taskbar **Windows only**. Using `None` to remove the overlay icon
+  ///
+  /// The overlay icon can be unique for each window.
+  #[cfg(target_os = "windows")]
+  #[cfg_attr(docsrs, doc(cfg(target_os = "windows")))]
+  pub fn set_overlay_icon(&self, icon: Option<Image<'_>>) -> crate::Result<()> {
+    self
+      .window
+      .dispatcher
+      .set_overlay_icon(icon.map(|x| x.into()))
+      .map_err(Into::into)
+  }
+
+  /// Sets the taskbar badge count. Using `0` or `None` will remove the badge
+  ///
+  /// ## Platform-specific
+  /// - **Windows:** Unsupported, use [`Window::set_overlay_icon`] instead.
+  /// - **iOS:** iOS expects i32, the value will be clamped to i32::MIN, i32::MAX.
+  /// - **Android:** Unsupported.
+  pub fn set_badge_count(&self, count: Option<i64>) -> crate::Result<()> {
+    self
+      .window
+      .dispatcher
+      .set_badge_count(count, Some(format!("{}.desktop", self.package_info().name)))
+      .map_err(Into::into)
+  }
+
+  /// Sets the taskbar badge label **macOS only**. Using `None` will remove the badge
+  #[cfg(target_os = "macos")]
+  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
+  pub fn set_badge_label(&self, label: Option<String>) -> crate::Result<()> {
+    self
+      .window
+      .dispatcher
+      .set_badge_label(label)
+      .map_err(Into::into)
+  }
+
   /// Sets the taskbar progress state.
   ///
   /// ## Platform-specific
@@ -1980,10 +2066,11 @@ tauri::Builder::default()
       .set_progress_bar(crate::runtime::ProgressBarState {
         status: progress_state.status,
         progress: progress_state.progress,
-        desktop_filename: Some(format!("{}.desktop", self.package_info().crate_name)),
+        desktop_filename: Some(format!("{}.desktop", self.package_info().name)),
       })
       .map_err(Into::into)
   }
+
   /// Sets the title bar style. **macOS only**.
   pub fn set_title_bar_style(&self, style: tauri_utils::TitleBarStyle) -> crate::Result<()> {
     self
@@ -1991,6 +2078,35 @@ tauri::Builder::default()
       .dispatcher
       .set_title_bar_style(style)
       .map_err(Into::into)
+  }
+
+  /// Sets the theme for this window.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Linux / macOS**: Theme is app-wide and not specific to this window.
+  /// - **iOS / Android:** Unsupported.
+  pub fn set_theme(&self, theme: Option<Theme>) -> crate::Result<()> {
+    self
+      .window
+      .dispatcher
+      .set_theme(theme)
+      .map_err(Into::<crate::Error>::into)?;
+    #[cfg(windows)]
+    if let (Some(menu), Ok(hwnd)) = (self.menu(), self.hwnd()) {
+      let raw_hwnd = hwnd.0 as isize;
+      self.run_on_main_thread(move || {
+        let _ = unsafe {
+          menu.inner().set_theme_for_hwnd(
+            raw_hwnd,
+            theme
+              .map(crate::menu::map_to_menu_theme)
+              .unwrap_or(muda::MenuTheme::Auto),
+          )
+        };
+      })?;
+    };
+    Ok(())
   }
 }
 
@@ -2000,7 +2116,7 @@ tauri::Builder::default()
   docsrs,
   doc(cfg(any(target_os = "macos", target_os = "linux", windows)))
 )]
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Debug)]
 pub struct ProgressBarState {
   /// The progress bar status.
   pub status: Option<ProgressBarStatus>,

@@ -21,11 +21,12 @@ use url::Url;
 
 use crate::{
   app::{GlobalWebviewEventListener, OnPageLoad, UriSchemeResponder, WebviewEvent},
-  ipc::{InvokeHandler, InvokeResponder},
+  ipc::InvokeHandler,
   pattern::PatternJavascript,
   sealed::ManagerBase,
   webview::PageLoadPayload,
-  AppHandle, Emitter, EventLoopMessage, EventTarget, Manager, Runtime, Scopes, Webview, Window,
+  Emitter, EventLoopMessage, EventTarget, Manager, Runtime, Scopes, UriSchemeContext, Webview,
+  Window,
 };
 
 use super::{
@@ -61,7 +62,7 @@ pub struct UriSchemeProtocol<R: Runtime> {
   /// Handler for protocol
   #[allow(clippy::type_complexity)]
   pub protocol:
-    Box<dyn Fn(&AppHandle<R>, http::Request<Vec<u8>>, UriSchemeResponder) + Send + Sync>,
+    Box<dyn Fn(UriSchemeContext<'_, R>, http::Request<Vec<u8>>, UriSchemeResponder) + Send + Sync>,
 }
 
 pub struct WebviewManager<R: Runtime> {
@@ -75,8 +76,6 @@ pub struct WebviewManager<R: Runtime> {
   /// Webview event listeners to all webviews.
   pub event_listeners: Arc<Vec<GlobalWebviewEventListener<R>>>,
 
-  /// Responder for invoke calls.
-  pub invoke_responder: Option<Arc<InvokeResponder<R>>>,
   /// The script that initializes the invoke system.
   pub invoke_initialization_script: String,
 
@@ -138,10 +137,14 @@ impl<R: Runtime> WebviewManager<R> {
 
     let mut webview_attributes = pending.webview_attributes;
 
+    let use_https_scheme = webview_attributes.use_https_scheme;
+
     let ipc_init = IpcJavascript {
       isolation_origin: &match &*app_manager.pattern {
         #[cfg(feature = "isolation")]
-        crate::Pattern::Isolation { schema, .. } => crate::pattern::format_real_schema(schema),
+        crate::Pattern::Isolation { schema, .. } => {
+          crate::pattern::format_real_schema(schema, use_https_scheme)
+        }
         _ => "".to_string(),
       },
     }
@@ -181,6 +184,7 @@ impl<R: Runtime> WebviewManager<R> {
         &ipc_init.into_string(),
         &pattern_init.into_string(),
         is_init_global,
+        use_https_scheme,
       )?);
 
     for plugin_init_script in plugin_init_scripts {
@@ -191,7 +195,7 @@ impl<R: Runtime> WebviewManager<R> {
     if let crate::Pattern::Isolation { schema, .. } = &*app_manager.pattern {
       webview_attributes = webview_attributes.initialization_script(
         &IsolationJavascript {
-          isolation_src: &crate::pattern::format_real_schema(schema),
+          isolation_src: &crate::pattern::format_real_schema(schema, use_https_scheme),
           style: tauri_utils::pattern::isolation::IFRAME_STYLE,
         }
         .render_default(&Default::default())?
@@ -212,14 +216,18 @@ impl<R: Runtime> WebviewManager<R> {
     for (uri_scheme, protocol) in &*self.uri_scheme_protocols.lock().unwrap() {
       registered_scheme_protocols.push(uri_scheme.clone());
       let protocol = protocol.clone();
-      let app_handle = Mutex::new(manager.app_handle().clone());
-      pending.register_uri_scheme_protocol(uri_scheme.clone(), move |p, responder| {
-        (protocol.protocol)(
-          &app_handle.lock().unwrap(),
-          p,
-          UriSchemeResponder(responder),
-        )
-      });
+      let app_handle = manager.app_handle().clone();
+
+      pending.register_uri_scheme_protocol(
+        uri_scheme.clone(),
+        move |webview_id, request, responder| {
+          let context = UriSchemeContext {
+            app_handle: &app_handle,
+            webview_label: webview_id,
+          };
+          (protocol.protocol)(context, request, UriSchemeResponder(responder))
+        },
+      );
     }
 
     let window_url = Url::parse(&pending.url).unwrap();
@@ -229,7 +237,8 @@ impl<R: Runtime> WebviewManager<R> {
       && window_url.scheme() != "http"
       && window_url.scheme() != "https"
     {
-      format!("http://{}.localhost", window_url.scheme())
+      let https = if use_https_scheme { "https" } else { "http" };
+      format!("{https}://{}.localhost", window_url.scheme())
     } else if let Some(host) = window_url.host() {
       format!(
         "{}://{}{}",
@@ -251,16 +260,16 @@ impl<R: Runtime> WebviewManager<R> {
         &window_origin,
         web_resource_request_handler,
       );
-      pending.register_uri_scheme_protocol("tauri", move |request, responder| {
-        protocol(request, UriSchemeResponder(responder))
+      pending.register_uri_scheme_protocol("tauri", move |webview_id, request, responder| {
+        protocol(webview_id, request, UriSchemeResponder(responder))
       });
       registered_scheme_protocols.push("tauri".into());
     }
 
     if !registered_scheme_protocols.contains(&"ipc".into()) {
-      let protocol = crate::ipc::protocol::get(manager.manager_owned(), pending.label.clone());
-      pending.register_uri_scheme_protocol("ipc", move |request, responder| {
-        protocol(request, UriSchemeResponder(responder))
+      let protocol = crate::ipc::protocol::get(manager.manager_owned());
+      pending.register_uri_scheme_protocol("ipc", move |webview_id, request, responder| {
+        protocol(webview_id, request, UriSchemeResponder(responder))
       });
       registered_scheme_protocols.push("ipc".into());
     }
@@ -298,8 +307,8 @@ impl<R: Runtime> WebviewManager<R> {
         .asset_protocol
         .clone();
       let protocol = crate::protocol::asset::get(asset_scope.clone(), window_origin.clone());
-      pending.register_uri_scheme_protocol("asset", move |request, responder| {
-        protocol(request, UriSchemeResponder(responder))
+      pending.register_uri_scheme_protocol("asset", move |webview_id, request, responder| {
+        protocol(webview_id, request, UriSchemeResponder(responder))
       });
     }
 
@@ -317,9 +326,10 @@ impl<R: Runtime> WebviewManager<R> {
         assets.clone(),
         *crypto_keys.aes_gcm().raw(),
         window_origin,
+        use_https_scheme,
       );
-      pending.register_uri_scheme_protocol(schema, move |request, responder| {
-        protocol(request, UriSchemeResponder(responder))
+      pending.register_uri_scheme_protocol(schema, move |webview_id, request, responder| {
+        protocol(webview_id, request, UriSchemeResponder(responder))
       });
     }
 
@@ -332,6 +342,7 @@ impl<R: Runtime> WebviewManager<R> {
     ipc_script: &str,
     pattern_script: &str,
     with_global_tauri: bool,
+    use_https_scheme: bool,
   ) -> crate::Result<String> {
     #[derive(Template)]
     #[default_template("../../scripts/init.js")]
@@ -354,6 +365,7 @@ impl<R: Runtime> WebviewManager<R> {
     #[default_template("../../scripts/core.js")]
     struct CoreJavascript<'a> {
       os_name: &'a str,
+      protocol_scheme: &'a str,
       invoke_key: &'a str,
     }
 
@@ -375,6 +387,7 @@ impl<R: Runtime> WebviewManager<R> {
       bundle_script,
       core_script: &CoreJavascript {
         os_name: std::env::consts::OS,
+        protocol_scheme: if use_https_scheme { "https" } else { "http" },
         invoke_key: self.invoke_key(),
       }
       .render_default(&Default::default())?
@@ -408,7 +421,7 @@ impl<R: Runtime> WebviewManager<R> {
         let url = if PROXY_DEV_SERVER {
           Cow::Owned(Url::parse("tauri://localhost").unwrap())
         } else {
-          app_manager.get_url()
+          app_manager.get_url(pending.webview_attributes.use_https_scheme)
         };
         // ignore "index.html" just to simplify the url
         if path.to_str() != Some("index.html") {
@@ -422,7 +435,7 @@ impl<R: Runtime> WebviewManager<R> {
         }
       }
       WebviewUrl::External(url) => {
-        let config_url = app_manager.get_url();
+        let config_url = app_manager.get_url(pending.webview_attributes.use_https_scheme);
         let is_local = config_url.make_relative(url).is_some();
         let mut url = url.clone();
         if is_local && PROXY_DEV_SERVER {
@@ -569,8 +582,9 @@ impl<R: Runtime> WebviewManager<R> {
     &self,
     window: Window<R>,
     webview: DetachedWebview<EventLoopMessage, R>,
+    use_https_scheme: bool,
   ) -> Webview<R> {
-    let webview = Webview::new(window, webview);
+    let webview = Webview::new(window, webview, use_https_scheme);
 
     let webview_event_listeners = self.event_listeners.clone();
     let webview_ = webview.clone();
@@ -621,9 +635,9 @@ impl<R: Runtime> WebviewManager<R> {
 
   pub fn eval_script_all<S: Into<String>>(&self, script: S) -> crate::Result<()> {
     let script = script.into();
-    self
-      .webviews_lock()
-      .values()
+    let webviews = self.webviews_lock().values().cloned().collect::<Vec<_>>();
+    webviews
+      .iter()
       .try_for_each(|webview| webview.eval(&script))
   }
 
